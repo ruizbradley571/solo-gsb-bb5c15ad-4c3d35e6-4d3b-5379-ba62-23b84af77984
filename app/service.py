@@ -27,9 +27,18 @@
   稳定排序后以候选静默间隔重新切分，得到不落库的模拟段与临时编号；
 - 依据事件成员关系给出每个现有段到模拟段的 unchanged/split/merged 映射；
 - 不写任何表（调用方开启 query_only 双重保险），结果对重复请求确定一致。
+
+事件审计查询（list_events，纯读）：
+- 在调用方提供的同一只读快照内按 (occurred_at, event_id) 稳定排序返回事件，
+  支持 source 必填、起止时间与 severity 多值过滤；
+- 键集分页游标 after/next_after 为不透明字符串，编码上一页末行的
+  (occurred_at, event_id) 复合位置；空页回显入参 after，游标保持不变。
 """
 from __future__ import annotations
 
+import base64
+import json
+import math
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -68,6 +77,103 @@ def list_segments(conn: sqlite3.Connection, source: str | None = None) -> list[d
             "SELECT * FROM segments WHERE source = ? ORDER BY id", (source,)
         ).fetchall()
     return [_row_to_segment(r) for r in rows]
+
+
+def encode_event_cursor(occurred_ts: float, event_id: str) -> str:
+    """把 (occurred_at, event_id) 复合排序位置编码为不透明分页游标（base64url JSON）。"""
+    raw = json.dumps(
+        [occurred_ts, event_id], separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def decode_event_cursor(cursor: str) -> tuple[float, str]:
+    """解码游标为 (occurred_ts, event_id)；游标非法时抛 ValueError（调用方回 422）。"""
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        raw = base64.urlsafe_b64decode(padded.encode("ascii"))
+        value = json.loads(raw)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ValueError("非法 after 游标") from exc
+    if (
+        not isinstance(value, list)
+        or len(value) != 2
+        or isinstance(value[0], bool)
+        or not isinstance(value[0], (int, float))
+        or not isinstance(value[1], str)
+        or not math.isfinite(float(value[0]))
+    ):
+        raise ValueError("非法 after 游标")
+    return float(value[0]), value[1]
+
+
+def _row_to_event(row: sqlite3.Row) -> dict:
+    return {
+        "source": row["source"],
+        "event_id": row["event_id"],
+        "occurred_at": _iso(row["occurred_at"]),
+        "severity": row["severity"],
+        "segment_id": row["segment_id"],
+    }
+
+
+def list_events(
+    conn: sqlite3.Connection,
+    *,
+    source: str,
+    start_ts: float | None = None,
+    end_ts: float | None = None,
+    severities: list[str] | None = None,
+    after: str | None = None,
+    limit: int = 100,
+) -> dict:
+    """事件审计查询：同一只读快照内按 (occurred_at, event_id) 升序返回一页。
+
+    - source 必填；start_ts/end_ts 为可选闭区间边界（epoch 秒）；
+    - severities 为已归一化的级别多值过滤（None 或空列表表示不过滤）；
+    - after 为上一页 next_after 不透明游标（None 表示从头开始），键集分页条件为
+      (occurred_at, event_id) 严格大于游标位置，不漏读、不重复；
+    - 返回 {"events": [...], "next_after": str}；空页时 next_after 回显入参 after。
+
+    调用方应使用 read_only_session：本函数只执行 SELECT，多次访问共享同一快照。
+    """
+    clauses = ["source = ?"]
+    params: list = [source]
+    if start_ts is not None:
+        clauses.append("occurred_at >= ?")
+        params.append(start_ts)
+    if end_ts is not None:
+        clauses.append("occurred_at <= ?")
+        params.append(end_ts)
+    if severities:
+        clauses.append(f"severity IN ({','.join('?' * len(severities))})")
+        params.extend(severities)
+    if after is not None:
+        cursor_ts, cursor_event_id = decode_event_cursor(after)
+        # 复合键严格大于：(occurred_at > ts) OR (occurred_at = ts AND event_id > eid)
+        clauses.append(
+            "(occurred_at > ? OR (occurred_at = ? AND event_id > ?))"
+        )
+        params.extend([cursor_ts, cursor_ts, cursor_event_id])
+
+    where = " AND ".join(clauses)
+    rows = conn.execute(
+        f"""
+        SELECT source, event_id, occurred_at, severity, segment_id
+        FROM events
+        WHERE {where}
+        ORDER BY occurred_at, event_id
+        LIMIT ?
+        """,
+        (*params, limit),
+    ).fetchall()
+    events = [_row_to_event(r) for r in rows]
+    next_after = (
+        encode_event_cursor(rows[-1]["occurred_at"], rows[-1]["event_id"])
+        if rows
+        else after
+    )
+    return {"events": events, "next_after": next_after}
 
 
 def _record_change(

@@ -30,6 +30,8 @@ CREATE TABLE IF NOT EXISTS events (
     UNIQUE (source, event_id)                -- 幂等去重键
 );
 CREATE INDEX IF NOT EXISTS idx_events_segment ON events (segment_id);
+-- 事件审计查询：WHERE source = ? ... ORDER BY occurred_at, event_id
+CREATE INDEX IF NOT EXISTS idx_events_source_time ON events (source, occurred_at, event_id);
 
 -- 段变更流：供下游增量同步。与事件写入同事务追加，change_id 单调递增
 CREATE TABLE IF NOT EXISTS segment_changes (

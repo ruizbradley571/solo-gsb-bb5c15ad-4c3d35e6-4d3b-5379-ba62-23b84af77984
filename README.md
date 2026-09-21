@@ -1,6 +1,6 @@
 # 设备告警事件段聚合服务
 
-基于 FastAPI + SQLite 的告警汇聚服务：客户端上报离散告警事件，服务按 **source + 可配置静默间隔** 将乱序到达的事件归入同一事件段（segment），并保证 **event_id 幂等去重**——重复提交不改变任何计数。误报事件可通过 `DELETE /events/{source}/{event_id}` 撤回，服务在单事务内删除事件并按静默间隔重算其原段（删除/收缩/拆分）。每次段变更都会同事务写入**单调递增的变更流**，下游可通过 `GET /segment-changes` 做增量同步。
+基于 FastAPI + SQLite 的告警汇聚服务：客户端上报离散告警事件，服务按 **source + 可配置静默间隔** 将乱序到达的事件归入同一事件段（segment），并保证 **event_id 幂等去重**——重复提交不改变任何计数。误报事件可通过 `DELETE /events/{source}/{event_id}` 撤回，服务在单事务内删除事件并按静默间隔重算其原段（删除/收缩/拆分）。`GET /events` 提供事件审计查询：在单一只读快照内按 `(occurred_at, event_id)` 稳定排序、支持时间窗与 severity 多值过滤及游标分页。每次段变更都会同事务写入**单调递增的变更流**，下游可通过 `GET /segment-changes` 做增量同步。
 
 ## 快速开始
 
@@ -67,6 +67,46 @@ curl -X DELETE http://localhost:8000/events/edge-gateway-01/evt-0001
 - **`split_segment`**：该事件原本桥接了两侧事件（迟到事件造成的合并），移除后按静默间隔重新切成多段 → **最早子段沿用原段 id**（`revision` 在原值上 +1），**其余子段全部新建**（`revision=1`，不复用历史段 id），`segments` 按时间序返回全部子段。
 - 重算内容：子段的起止时间、`event_count` 与 `max_severity` 均由剩余事件重新计算（例如撤回唯一的 `critical` 事件后最高级别回落）。撤回仅影响该事件所在段，不触碰同一 source 的其他段、更不影响其他 source。
 - 撤回释放了 `(source, event_id)` 幂等键，之后可重新提交同一事件并照常归段。
+
+### 事件审计查询 `GET /events`
+
+分页审计查询已入库的原始事件。整个请求在**单一只读快照事务**（`query_only` 连接）内完成，排序键为 `(occurred_at, event_id)` **稳定升序**（同一时刻按 `event_id` 决定次序）；与 `POST /events` 同路径、HTTP 方法不同，互不影响。
+
+```bash
+curl 'http://localhost:8000/events?source=edge-gateway-01&start_at=2026-09-20T00:00:00Z&end_at=2026-09-21T00:00:00Z&severity=error&severity=critical&limit=100'
+```
+
+```json
+{
+  "events": [
+    {
+      "source": "edge-gateway-01",
+      "event_id": "evt-0001",
+      "occurred_at": "2026-09-20T08:00:00+00:00",
+      "severity": "critical",
+      "segment_id": 7
+    }
+  ],
+  "next_after": "WzE3ODk4OTEyMDAuMCwiZXZ0LTAwMDEiXQ"
+}
+```
+
+查询参数：
+
+| 参数 | 必填 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `source` | 是 | — | 只返回该来源的事件（1–256 字符） |
+| `start_at` | 否 | — | 发生时间下界（**含边界**），ISO 8601；无时区按 UTC 处理；不得晚于 `end_at` |
+| `end_at` | 否 | — | 发生时间上界（**含边界**），ISO 8601；无时区按 UTC 处理 |
+| `severity` | 否 | — | 级别多值过滤，**可重复传入**（`?severity=error&severity=critical`），大小写不敏感并接受 `warn`/`fatal` 别名；不传表示不过滤 |
+| `after` | 否 | 从头开始 | 上一页返回的 `next_after` **不透明游标**（请勿自行构造或解析） |
+| `limit` | 否 | `100` | 每页条数，范围 1–**1000** |
+
+- **`segment_id` 是查询时刻的实时归属**：事件归段可能因迟到事件合并、误报撤回重算而变化，该字段始终反映当前快照中的所属段 id（不保证与事件首次入库时的段一致）。
+- **分页约定**：用上一页的 `next_after` 作为下一页的 `after`；游标编码的是 `(occurred_at, event_id)` 复合位置，分页期间新写入的事件只会获得更靠后的位置——**不漏读、不重复**。
+- **空页游标保持不变**：到达末尾时返回 `{"events": [], "next_after": "<同一个 after>"}`，可直接用该游标继续轮询；首次请求（不带 `after`）且无数据时 `next_after` 为 `null`。
+- **快照一致性**：全部过滤与分页读取在同一只读事务快照内完成，请求期间的并发写入不影响本次结果；接口纯读，不会改写事件、段或变更流。
+- 参数校验失败（缺 `source`、`limit` 越界、非法 `severity`/时间、`start_at > end_at`、伪造游标）统一返回 `422`。
 
 ### 查询事件段详情 `GET /segments/{id}`
 
@@ -230,7 +270,7 @@ python3 -m unittest tests.test_service -v
 ```
 app/
   main.py      # FastAPI 路由与生命周期（启动时幂等建表）
-  service.py   # 归段/合并/去重核心逻辑
+  service.py   # 归段/合并/去重/撤回核心逻辑与事件审计查询
   schemas.py   # 请求/响应模型与校验
   severity.py  # 告警级别定义与排序
   db.py        # SQLite 连接、schema、事务

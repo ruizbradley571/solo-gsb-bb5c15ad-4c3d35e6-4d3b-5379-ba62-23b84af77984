@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import threading
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Query
 
@@ -10,6 +11,7 @@ from .config import Settings
 from .db import init_db, read_only_session, session
 from .schemas import (
     EventIn,
+    EventsPage,
     IngestResponse,
     ResegmentationPreviewResponse,
     SegmentChangesPage,
@@ -17,6 +19,7 @@ from .schemas import (
     WithdrawResponse,
 )
 from . import service
+from . import severity as sev
 
 # SQLite 单写者：进程内串行化归段写入（含撤回），配合事务保证合并/拆段一致性
 _ingest_lock = threading.Lock()
@@ -30,13 +33,64 @@ def create_app(settings: Settings) -> FastAPI:
 
     app = FastAPI(
         title="设备告警事件段聚合服务",
-        version="1.1.0",
+        version="1.2.0",
         lifespan=lifespan,
     )
 
     @app.get("/healthz")
     def healthz() -> dict:
         return {"status": "ok"}
+
+    @app.get("/events", response_model=EventsPage)
+    def list_events(
+        source: str = Query(min_length=1, max_length=256),
+        start_at: datetime | None = Query(default=None),
+        end_at: datetime | None = Query(default=None),
+        severity: list[str] | None = Query(default=None),
+        after: str | None = Query(default=None, min_length=1, max_length=512),
+        limit: int = Query(default=100, ge=1, le=1000),
+    ) -> dict:
+        """事件审计查询：在**单一只读快照**内按 (occurred_at, event_id) 稳定升序分页。
+
+        - ``source`` 必填；``start_at`` / ``end_at`` 为可选的发生时间闭区间
+          （ISO 8601，无时区按 UTC 处理，边界包含）；
+        - ``severity`` 可重复传入做多值过滤（``?severity=error&severity=critical``），
+          大小写不敏感并接受 ``warn``/``fatal`` 别名，非法值返回 422；
+        - ``after`` 为上一页返回的 ``next_after`` 不透明游标（首页不传）；
+          ``limit`` 默认 100、最大 1000；
+        - 每条事件返回 source、event_id、occurred_at、severity 与**当前**
+          segment_id（撤回/合并重算后的实时归属）；
+        - 空页时 ``next_after`` 与入参 ``after`` 相同，游标保持不变，可直接继续轮询。
+        """
+        if start_at is not None and start_at.tzinfo is None:
+            start_at = start_at.replace(tzinfo=timezone.utc)
+        if end_at is not None and end_at.tzinfo is None:
+            end_at = end_at.replace(tzinfo=timezone.utc)
+        if start_at is not None and end_at is not None and start_at > end_at:
+            raise HTTPException(
+                status_code=422, detail="start_at 不能晚于 end_at"
+            )
+
+        severities: list[str] | None = None
+        if severity:
+            try:
+                severities = sorted({sev.normalize(s) for s in severity})
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        try:
+            with read_only_session(settings.database_path) as conn:
+                return service.list_events(
+                    conn,
+                    source=source,
+                    start_ts=start_at.timestamp() if start_at else None,
+                    end_ts=end_at.timestamp() if end_at else None,
+                    severities=severities,
+                    after=after,
+                    limit=limit,
+                )
+        except ValueError as exc:  # 游标解码失败等输入错误 → 422
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/events", response_model=IngestResponse)
     def submit_event(event: EventIn) -> dict:
