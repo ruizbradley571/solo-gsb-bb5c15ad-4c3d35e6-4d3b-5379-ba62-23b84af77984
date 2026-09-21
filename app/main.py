@@ -3,13 +3,16 @@ from __future__ import annotations
 
 import threading
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Query
 
+from . import severity as sev
 from .config import Settings
 from .db import init_db, read_only_session, session
 from .schemas import (
     EventIn,
+    EventsPage,
     IngestResponse,
     ResegmentationPreviewResponse,
     SegmentChangesPage,
@@ -30,7 +33,7 @@ def create_app(settings: Settings) -> FastAPI:
 
     app = FastAPI(
         title="设备告警事件段聚合服务",
-        version="1.1.0",
+        version="1.2.0",
         lifespan=lifespan,
     )
 
@@ -51,6 +54,55 @@ def create_app(settings: Settings) -> FastAPI:
                 severity=event.severity,
                 silence=settings.silence_interval_seconds,
             )
+
+    @app.get("/events", response_model=EventsPage)
+    def list_events(
+        source: str = Query(min_length=1, max_length=256),
+        start_at: datetime | None = Query(default=None),
+        end_at: datetime | None = Query(default=None),
+        severity: list[str] | None = Query(default=None),
+        after: str | None = Query(default=None),
+        limit: int = Query(default=100, ge=1, le=1000),
+    ) -> dict:
+        """事件审计查询：按 (occurred_at, event_id) 稳定升序分页返回事件。
+
+        - source 必填；start_at/end_at 为 occurred_at 的闭区间（ISO 8601，
+          无时区按 UTC 处理）；severity 可重复传参做多值过滤（大小写不敏感，
+          别名 warn/fatal 归一，非法值返回 422）；
+        - after 为上一页返回的 next_after 不透明游标，空页游标原样回显；
+        - 全程只读：整页查询在同一个 query_only 快照事务内一次 SELECT 完成，
+          不与写入竞争，分页期间的新写入只出现在后续页，不漏读、不重复。
+        """
+        if start_at is not None and start_at.tzinfo is None:
+            start_at = start_at.replace(tzinfo=timezone.utc)
+        if end_at is not None and end_at.tzinfo is None:
+            end_at = end_at.replace(tzinfo=timezone.utc)
+        if start_at is not None and end_at is not None and start_at > end_at:
+            raise HTTPException(
+                status_code=422, detail="start_at must not be later than end_at"
+            )
+
+        normalized: list[str] | None = None
+        if severity:
+            try:
+                # 去重保持确定行为；非法级别与 POST /events 一样拒绝
+                normalized = sorted({sev.normalize(s) for s in severity})
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        with read_only_session(settings.database_path) as conn:
+            try:
+                return service.list_events(
+                    conn,
+                    source=source,
+                    start_ts=start_at.timestamp() if start_at else None,
+                    end_ts=end_at.timestamp() if end_at else None,
+                    severities=normalized,
+                    after=after,
+                    limit=limit,
+                )
+            except ValueError as exc:  # 游标非法
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.delete("/events/{source}/{event_id}", response_model=WithdrawResponse)
     def withdraw_event(source: str, event_id: str) -> dict:

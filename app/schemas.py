@@ -45,6 +45,31 @@ class IngestResponse(BaseModel):
     segment: SegmentOut
 
 
+class EventOut(BaseModel):
+    """事件审计视图：事件四要素及其当前归属段。
+
+    segment_id 为查询时刻的归属：合并/撤回重切后事件可能改挂到其他段
+    （被合并段不会出现在本字段中）。
+    """
+
+    source: str
+    event_id: str
+    occurred_at: datetime
+    severity: str
+    segment_id: int
+
+
+class EventsPage(BaseModel):
+    """事件审计一页；next_after 为不透明游标，原样作为下一页的 after 继续拉取。
+
+    空页（含首轮无数据）时 next_after 为 null（未传 after）或原样回传入参
+    after，游标不前进，可直接继续轮询。
+    """
+
+    events: list[EventOut]
+    next_after: str | None = None
+
+
 class WithdrawResponse(BaseModel):
     """误报事件撤回结果。
 

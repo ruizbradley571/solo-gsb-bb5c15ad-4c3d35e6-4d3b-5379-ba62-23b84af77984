@@ -27,9 +27,19 @@
   稳定排序后以候选静默间隔重新切分，得到不落库的模拟段与临时编号；
 - 依据事件成员关系给出每个现有段到模拟段的 unchanged/split/merged 映射；
 - 不写任何表（调用方开启 query_only 双重保险），结果对重复请求确定一致。
+
+事件审计查询（list_events，纯读）：
+- 在同一只读快照内按 (occurred_at, event_id) 稳定升序返回某 source 的事件，
+  返回事件的 source/event_id/occurred_at/severity 与其当前 segment_id；
+- 可选起止时间（闭区间）与 severity 多值过滤，以不透明游标
+  （base64url 编码的 (occurred_at, event_id)）做键集分页；
+- 空页的 next_after 与入参 after 相同（首轮为 None），便于稳定轮询。
 """
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -142,6 +152,110 @@ def list_segment_changes(
     changes = [_row_to_change(r) for r in rows]
     next_after = changes[-1]["change_id"] if changes else after
     return {"changes": changes, "next_after": next_after}
+
+
+# ---- 事件审计查询（GET /events）----
+#
+# 排序键为 (occurred_at, event_id)：occurred_at 同为 epoch 秒，event_id 在
+# 同一 source 内唯一，因此二元组全序唯一，同刻事件也能确定地分页、不重不漏。
+# 游标只承载排序键（不绑定 source/过滤条件），调用方应在同一组过滤参数下使用。
+
+def _encode_event_cursor(occurred_ts: float, event_id: str) -> str:
+    raw = json.dumps(
+        {"occurred_at": occurred_ts, "event_id": event_id},
+        separators=(",", ":"),  # 紧凑编码；游标不透明，不追求可读性
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def _decode_event_cursor(cursor: str) -> tuple[float, str]:
+    """解码事件分页游标；格式或内容非法时抛 ValueError（路由层转 422）。"""
+    try:
+        raw = base64.b64decode(
+            cursor.encode("ascii"), altchars=b"-_", validate=True
+        )
+        payload = json.loads(raw)
+    except (binascii.Error, ValueError, UnicodeDecodeError) as exc:
+        raise ValueError("invalid after cursor") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("invalid after cursor")
+    ts = payload.get("occurred_at")
+    event_id = payload.get("event_id")
+    # bool 是 int 子类但不是合法时间戳，显式排除
+    if (
+        not isinstance(ts, (int, float))
+        or isinstance(ts, bool)
+        or not isinstance(event_id, str)
+        or not event_id
+    ):
+        raise ValueError("invalid after cursor")
+    return float(ts), event_id
+
+
+def _row_to_event(row: sqlite3.Row) -> dict:
+    return {
+        "source": row["source"],
+        "event_id": row["event_id"],
+        "occurred_at": _iso(row["occurred_at"]),
+        "severity": row["severity"],
+        "segment_id": row["segment_id"],  # 当前归属段（合并/撤回重切后随之变化）
+    }
+
+
+def list_events(
+    conn: sqlite3.Connection,
+    *,
+    source: str,
+    start_ts: float | None = None,
+    end_ts: float | None = None,
+    severities: list[str] | None = None,
+    after: str | None = None,
+    limit: int = 100,
+) -> dict:
+    """按 (occurred_at, event_id) 升序返回某 source 事件审计页（纯读）。
+
+    调用方需在同一只读快照事务内调用（见 db.read_only_session），本函数只
+    执行一条 SELECT。键集分页：游标之后的行满足 occurred_at 更大，或同一
+    时刻 event_id 更大；过滤条件与排序键无交集，分页期间事件表的新增/归属
+    调整只会带来更大的排序键，不会漏读或重复。空页 next_after 原样回显入参
+    after（首轮为 None），便于轮询。
+    """
+    clauses = ["source = ?"]
+    params: list = [source]
+
+    if start_ts is not None:
+        clauses.append("occurred_at >= ?")
+        params.append(start_ts)
+    if end_ts is not None:
+        clauses.append("occurred_at <= ?")
+        params.append(end_ts)
+    if severities:
+        clauses.append(f"severity IN ({','.join('?' * len(severities))})")
+        params.extend(severities)
+
+    if after is not None:
+        cursor_ts, cursor_event_id = _decode_event_cursor(after)
+        clauses.append("(occurred_at > ? OR (occurred_at = ? AND event_id > ?))")
+        params.extend([cursor_ts, cursor_ts, cursor_event_id])
+
+    rows = conn.execute(
+        f"""
+        SELECT source, event_id, occurred_at, severity, segment_id
+        FROM events
+        WHERE {' AND '.join(clauses)}
+        ORDER BY occurred_at, event_id
+        LIMIT ?
+        """,
+        (*params, limit),
+    ).fetchall()
+
+    events = [_row_to_event(r) for r in rows]
+    next_after = (
+        _encode_event_cursor(rows[-1]["occurred_at"], rows[-1]["event_id"])
+        if rows
+        else after
+    )
+    return {"events": events, "next_after": next_after}
 
 
 def _find_merge_candidates(

@@ -52,6 +52,10 @@ class ServiceTestCase(unittest.TestCase):
         with session(self.db_path) as conn:
             return service.list_segment_changes(conn, after=after, limit=limit)
 
+    def list_events(self, source, **kwargs):
+        with read_only_session(self.db_path) as conn:
+            return service.list_events(conn, source=source, **kwargs)
+
     def test_first_event_creates_segment(self):
         r = self.submit("s1", "e1", 1000.0, "warning")
         self.assertFalse(r["deduplicated"])
@@ -689,6 +693,145 @@ class ServiceTestCase(unittest.TestCase):
                 ).fetchone()[0],
                 snapshot["changes"],
             )
+
+    # ---- 事件审计查询（list_events）----
+
+    def test_list_events_orders_by_occurred_at_then_event_id(self):
+        # 乱序提交：不同刻 + 同刻，验证返回按 (occurred_at, event_id) 稳定排序
+        self.submit("s1", "e3", 30.0, "error")
+        self.submit("s1", "e1", 10.0, "info")
+        self.submit("s1", "b", 20.0, "warning")
+        self.submit("s1", "a", 20.0, "debug")  # 与 b 同刻 → event_id 决胜
+        page = self.list_events("s1")
+        self.assertEqual(
+            [(e["event_id"], e["severity"]) for e in page["events"]],
+            [("e1", "info"), ("a", "debug"), ("b", "warning"), ("e3", "error")],
+        )
+        for e in page["events"]:
+            self.assertEqual(e["source"], "s1")
+            self.assertIsInstance(e["segment_id"], int)
+        # 非空首页的 next_after 指向末行排序键（与变更流分页语义一致）
+        self.assertEqual(
+            service._decode_event_cursor(page["next_after"]), (30.0, "e3")
+        )
+
+    def test_list_events_empty_page_returns_null_cursor(self):
+        page = self.list_events("ghost")
+        self.assertEqual(page, {"events": [], "next_after": None})
+
+    def test_list_events_filters_by_source(self):
+        self.submit("s1", "e1", 10.0)
+        self.submit("s2", "e2", 10.0)
+        page = self.list_events("s1")
+        self.assertEqual([e["event_id"] for e in page["events"]], ["e1"])
+
+    def test_list_events_time_range_is_inclusive(self):
+        self.submit("s1", "e1", 10.0)
+        self.submit("s1", "e2", 20.0)
+        self.submit("s1", "e3", 30.0)
+        page = self.list_events("s1", start_ts=10.0, end_ts=20.0)
+        self.assertEqual([e["event_id"] for e in page["events"]], ["e1", "e2"])
+        page = self.list_events("s1", start_ts=25.0)
+        self.assertEqual([e["event_id"] for e in page["events"]], ["e3"])
+        page = self.list_events("s1", end_ts=15.0)
+        self.assertEqual([e["event_id"] for e in page["events"]], ["e1"])
+
+    def test_list_events_severity_multi_filter(self):
+        self.submit("s1", "e1", 10.0, "info")
+        self.submit("s1", "e2", 20.0, "warning")
+        self.submit("s1", "e3", 30.0, "error")
+        page = self.list_events("s1", severities=["warning", "error"])
+        self.assertEqual([e["event_id"] for e in page["events"]], ["e2", "e3"])
+
+    def test_list_events_cursor_pagination_walks_all_rows(self):
+        for i in range(5):
+            self.submit("s1", f"e{i}", 100.0 + i)
+        p1 = self.list_events("s1", limit=2)
+        self.assertEqual([e["event_id"] for e in p1["events"]], ["e0", "e1"])
+        p2 = self.list_events("s1", after=p1["next_after"], limit=2)
+        self.assertEqual([e["event_id"] for e in p2["events"]], ["e2", "e3"])
+        p3 = self.list_events("s1", after=p2["next_after"], limit=100)
+        self.assertEqual([e["event_id"] for e in p3["events"]], ["e4"])
+        # 末页游标指向最后一行；再翻一页为空且游标原样回显
+        p4 = self.list_events("s1", after=p3["next_after"], limit=100)
+        self.assertEqual(p4["events"], [])
+        self.assertEqual(p4["next_after"], p3["next_after"])
+        seen = [e["event_id"] for p in (p1, p2, p3) for e in p["events"]]
+        self.assertEqual(seen, [f"e{i}" for i in range(5)])  # 不漏不重
+
+    def test_list_events_cursor_tiebreaks_same_timestamp(self):
+        self.submit("s1", "b", 0.0)
+        self.submit("s1", "a", 0.0)
+        self.submit("s1", "c", 0.0)
+        p1 = self.list_events("s1", limit=2)
+        self.assertEqual([e["event_id"] for e in p1["events"]], ["a", "b"])
+        p2 = self.list_events("s1", after=p1["next_after"], limit=2)
+        self.assertEqual([e["event_id"] for e in p2["events"]], ["c"])
+        self.assertEqual(
+            self.list_events("s1", after=p2["next_after"])["events"], []
+        )
+
+    def test_list_events_cursor_roundtrip(self):
+        cursor = service._encode_event_cursor(123.5, "evt-x")
+        self.assertEqual(service._decode_event_cursor(cursor), (123.5, "evt-x"))
+
+    def test_list_events_rejects_malformed_cursor(self):
+        import base64
+
+        for bad in ("not-base64!", base64.urlsafe_b64encode(b"not-json").decode()):
+            with self.assertRaises(ValueError):
+                self.list_events("s1", after=bad)
+        # 结构合法但字段缺失/类型错误同样拒绝
+        import json
+        payload = base64.urlsafe_b64encode(
+            json.dumps({"occurred_at": "soon", "event_id": 1}).encode()
+        ).decode()
+        with self.assertRaises(ValueError):
+            self.list_events("s1", after=payload)
+
+    def test_list_events_segment_id_follows_merges_and_withdraw_split(self):
+        a = self.submit("s1", "e1", 0.0)["segment"]["id"]
+        self.submit("s1", "e2", 20.0)        # 超静默（SILENCE=10）→ 段 B
+        self.submit("s1", "e3", 10.0)        # 恰好落在边界，桥接合并 → 全部挂到段 A
+        page = self.list_events("s1")
+        self.assertEqual({e["event_id"]: e["segment_id"] for e in page["events"]},
+                         {"e1": a, "e2": a, "e3": a})
+
+        self.withdraw("s1", "e3")            # 拆段：e1 在 A，e2 在新段
+        page = self.list_events("s1")
+        owners = {e["event_id"]: e["segment_id"] for e in page["events"]}
+        self.assertEqual(owners["e1"], a)
+        self.assertNotEqual(owners["e2"], a)
+
+    def test_list_events_filters_and_cursor_combined(self):
+        # 时间窗 + severity + 游标组合使用，仍按全局排序连续翻页
+        self.submit("s1", "e1", 10.0, "info")
+        self.submit("s1", "e2", 20.0, "error")
+        self.submit("s1", "e3", 30.0, "error")
+        self.submit("s1", "e4", 40.0, "info")
+        p1 = self.list_events(
+            "s1", start_ts=5.0, end_ts=45.0, severities=["error"], limit=1
+        )
+        self.assertEqual([e["event_id"] for e in p1["events"]], ["e2"])
+        p2 = self.list_events(
+            "s1", start_ts=5.0, end_ts=45.0, severities=["error"],
+            after=p1["next_after"], limit=1,
+        )
+        self.assertEqual([e["event_id"] for e in p2["events"]], ["e3"])
+
+    def test_list_events_is_read_only(self):
+        self.submit("s1", "e1", 10.0)
+        with session(self.db_path) as conn:
+            before = conn.execute("SELECT * FROM events").fetchall()
+            changes = service.list_segment_changes(conn)
+        self.list_events("s1", limit=1)
+        self.list_events("s1", severities=["info"], start_ts=0.0, end_ts=999.0)
+        with session(self.db_path) as conn:
+            self.assertEqual(
+                [tuple(r) for r in conn.execute("SELECT * FROM events")],
+                [tuple(r) for r in before],
+            )
+            self.assertEqual(service.list_segment_changes(conn), changes)
 
     # ---- 旧库迁移（segment_changes CHECK 增加 deleted）----
 

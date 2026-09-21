@@ -1,6 +1,6 @@
 # 设备告警事件段聚合服务
 
-基于 FastAPI + SQLite 的告警汇聚服务：客户端上报离散告警事件，服务按 **source + 可配置静默间隔** 将乱序到达的事件归入同一事件段（segment），并保证 **event_id 幂等去重**——重复提交不改变任何计数。误报事件可通过 `DELETE /events/{source}/{event_id}` 撤回，服务在单事务内删除事件并按静默间隔重算其原段（删除/收缩/拆分）。每次段变更都会同事务写入**单调递增的变更流**，下游可通过 `GET /segment-changes` 做增量同步。
+基于 FastAPI + SQLite 的告警汇聚服务：客户端上报离散告警事件，服务按 **source + 可配置静默间隔** 将乱序到达的事件归入同一事件段（segment），并保证 **event_id 幂等去重**——重复提交不改变任何计数。误报事件可通过 `DELETE /events/{source}/{event_id}` 撤回，服务在单事务内删除事件并按静默间隔重算其原段（删除/收缩/拆分）。每次段变更都会同事务写入**单调递增的变更流**，下游可通过 `GET /segment-changes` 做增量同步。另有只读的事件审计查询接口 `GET /events`，按 `(occurred_at, event_id)` 稳定排序、以游标分页返回事件及其**当前**归属段。
 
 ## 快速开始
 
@@ -41,6 +41,52 @@ curl -X POST http://localhost:8000/events \
 - `severity` 取值：`debug` / `info` / `warning` / `error` / `critical`（大小写不敏感，`warn`、`fatal` 为别名）
 - `occurred_at` 为 ISO 8601 时间；不带时区时按 UTC 处理
 - 响应：`{"deduplicated": false, "segment": {...}}`；重复提交同一 `(source, event_id)` 时 `deduplicated: true`，计数不变
+
+### 事件审计查询 `GET /events`
+
+按 `(occurred_at, event_id)` **稳定升序**分页返回某 source 的原始事件及其**当前**归属段，用于审计/对账。查询全程只读，整页在**同一个只读快照事务**内一次 SELECT 完成（`query_only` 连接 + 复合索引，无临时排序），不与写入竞争；分页期间事件的新增或因撤回导致的归属重切只影响后续页，不漏读、不重复。
+
+```bash
+curl 'http://localhost:8000/events?source=edge-gateway-01&start_at=2026-09-20T00:00:00Z&end_at=2026-09-21T00:00:00Z&severity=warning&severity=critical&limit=100'
+```
+
+参数：
+
+| 参数 | 必填 | 说明 |
+| --- | --- | --- |
+| `source` | 是 | 只返回该来源的事件（1–256 字符） |
+| `start_at` | 否 | `occurred_at` 下界，**闭区间**（ISO 8601，无时区按 UTC 处理） |
+| `end_at` | 否 | `occurred_at` 上界，**闭区间**；`start_at` 晚于 `end_at` 返回 422 |
+| `severity` | 否 | 级别过滤，可**重复传参**做多值匹配；大小写不敏感，`warn`/`fatal` 别名归一，非法值返回 422 |
+| `after` | 否 | 上一页响应中的 `next_after` **不透明游标**（请勿自行构造），首次请求省略 |
+| `limit` | 否 | 每页条数，默认 `100`，范围 1–`1000` |
+
+```json
+{
+  "events": [
+    {
+      "source": "edge-gateway-01",
+      "event_id": "evt-0001",
+      "occurred_at": "2026-09-20T08:00:00+00:00",
+      "severity": "warning",
+      "segment_id": 1
+    },
+    {
+      "source": "edge-gateway-01",
+      "event_id": "evt-0002",
+      "occurred_at": "2026-09-20T08:00:00+00:00",
+      "severity": "error",
+      "segment_id": 1
+    }
+  ],
+  "next_after": "eyJvY2N1cnJlZF9hdCI6MTc4OTg5MTIwMC4wLCJldmVudF9pZCI6ImV2dC0wMDAyIn0="
+}
+```
+
+- **排序与分页**：先按 `occurred_at` 升序，同一时刻按 `event_id` 升序（同 source 内唯一），二元组保证全序；游标承载末行的 `(occurred_at, event_id)`，因此同刻事件也不会跨页重复或丢失。
+- **`segment_id` 是查询时刻的归属**：事件可能因迟到事件桥接合并且被 `UPDATE` 到保留段，或因撤回重切而改挂新段——接口返回的始终是当前值（已删除的段 id 不会出现）。
+- **空页约定**：翻到末尾时 `events` 为空，`next_after` 原样回显入参 `after`（首次请求即无数据时为 `null`），游标不前进，可直接继续轮询。
+- 游标应在**同一组过滤参数**下连续使用；游标格式非法（非 base64url、JSON 结构不符或字段缺失）返回 `422`。
 
 ### 撤回误报事件 `DELETE /events/{source}/{event_id}`
 

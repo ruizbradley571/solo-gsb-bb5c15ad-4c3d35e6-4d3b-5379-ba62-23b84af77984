@@ -4,6 +4,7 @@
 """
 import os
 import sys
+from datetime import datetime, timezone
 
 import pytest
 
@@ -14,6 +15,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from app.config import Settings  # noqa: E402
 from app.main import create_app  # noqa: E402
+from app.service import _decode_event_cursor  # noqa: E402
 
 
 @pytest.fixture()
@@ -448,3 +450,181 @@ def test_withdraw_path_params_are_url_segments(client):
     assert resp.json()["result"] == "deleted_segment"
     # 缺失路径段不会误匹配到该路由（交由 404/405 语义）
     assert client.delete("/events/edge-gateway.01").status_code in (404, 405)
+
+
+# ---- 事件审计查询 GET /events ----
+
+def test_get_events_requires_source(client):
+    assert client.get("/events").status_code == 422
+    assert client.get("/events", params={"source": ""}).status_code == 422
+
+
+def test_get_events_empty(client):
+    assert client.get("/events", params={"source": "gw-01"}).json() == {
+        "events": [],
+        "next_after": None,
+    }
+
+
+def test_get_events_orders_and_returns_fields_with_segment_id(client):
+    _post(client, "gw-01", "e3", "2026-09-20T08:02:00Z", "error")
+    _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z", "info")
+    seg = _post(client, "gw-01", "b", "2026-09-20T08:01:00Z", "warning")["segment"]
+    _post(client, "gw-01", "a", "2026-09-20T08:01:00Z", "debug")  # 同刻，event_id 决胜
+
+    body = client.get("/events", params={"source": "gw-01"}).json()
+    assert [e["event_id"] for e in body["events"]] == ["e1", "a", "b", "e3"]
+    # 非空页 next_after 指向末行（e3, 08:02:00）游标
+    cursor_ts, cursor_eid = _decode_event_cursor(body["next_after"])
+    assert cursor_eid == "e3"
+    assert cursor_ts == datetime(
+        2026, 9, 20, 8, 2, 0, tzinfo=timezone.utc
+    ).timestamp()
+    e1 = body["events"][0]
+    assert set(e1) == {"source", "event_id", "occurred_at", "severity", "segment_id"}
+    assert e1["source"] == "gw-01"
+    assert e1["event_id"] == "e1"
+    assert e1["occurred_at"].replace("Z", "+00:00") == "2026-09-20T08:00:00+00:00"
+    assert e1["severity"] == "info"
+    assert e1["segment_id"] == seg["id"]
+    # 同刻事件次序由 event_id 决定
+    assert body["events"][1]["event_id"] == "a"
+    assert body["events"][2]["event_id"] == "b"
+
+
+def test_get_events_isolated_by_source(client):
+    _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z")
+    _post(client, "gw-02", "e2", "2026-09-20T08:00:00Z")
+    body = client.get("/events", params={"source": "gw-01"}).json()
+    assert [e["event_id"] for e in body["events"]] == ["e1"]
+
+
+def test_get_events_time_range_filter_inclusive(client):
+    _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z", "info")
+    _post(client, "gw-01", "e2", "2026-09-20T08:01:00Z", "info")
+    _post(client, "gw-01", "e3", "2026-09-20T08:02:00Z", "info")
+    body = client.get("/events", params={
+        "source": "gw-01",
+        "start_at": "2026-09-20T08:00:00Z",
+        "end_at": "2026-09-20T08:01:00Z",
+    }).json()
+    assert [e["event_id"] for e in body["events"]] == ["e1", "e2"]  # 闭区间
+
+
+def test_get_events_naive_time_assumed_utc(client):
+    _post(client, "gw-01", "e1", "2026-09-20T08:00:30Z", "info")
+    body = client.get("/events", params={
+        "source": "gw-01", "start_at": "2026-09-20T08:00:00",
+    }).json()
+    assert [e["event_id"] for e in body["events"]] == ["e1"]
+
+
+def test_get_events_start_after_end_rejected(client):
+    resp = client.get("/events", params={
+        "source": "gw-01",
+        "start_at": "2026-09-20T08:02:00Z",
+        "end_at": "2026-09-20T08:00:00Z",
+    })
+    assert resp.status_code == 422
+
+
+def test_get_events_severity_multi_filter_normalized(client):
+    _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z", "info")
+    _post(client, "gw-01", "e2", "2026-09-20T08:00:30Z", "warning")
+    _post(client, "gw-01", "e3", "2026-09-20T08:01:00Z", "critical")
+    # 重复参数：多值过滤；大小写与别名（fatal→critical）归一化
+    body = client.get("/events", params=[
+        ("source", "gw-01"),
+        ("severity", "WARN"),
+        ("severity", "fatal"),
+    ]).json()
+    assert [e["event_id"] for e in body["events"]] == ["e2", "e3"]
+
+
+def test_get_events_invalid_severity_rejected(client):
+    resp = client.get("/events", params={"source": "gw-01", "severity": "bogus"})
+    assert resp.status_code == 422
+
+
+def test_get_events_pagination_no_miss_no_dup_and_empty_page_echoes_cursor(client):
+    for i in range(5):
+        _post(client, "gw-01", f"e{i}", f"2026-09-20T08:00:0{i}Z")
+
+    p1 = client.get("/events", params={"source": "gw-01", "limit": 2}).json()
+    assert [e["event_id"] for e in p1["events"]] == ["e0", "e1"]
+    assert p1["next_after"]
+
+    p2 = client.get("/events", params={
+        "source": "gw-01", "after": p1["next_after"], "limit": 2,
+    }).json()
+    assert [e["event_id"] for e in p2["events"]] == ["e2", "e3"]
+
+    p3 = client.get("/events", params={
+        "source": "gw-01", "after": p2["next_after"], "limit": 100,
+    }).json()
+    assert [e["event_id"] for e in p3["events"]] == ["e4"]
+
+    # 空页：next_after 与入参 after 完全相同，游标不前进
+    p4 = client.get("/events", params={
+        "source": "gw-01", "after": p3["next_after"],
+    }).json()
+    assert p4 == {"events": [], "next_after": p3["next_after"]}
+
+    ids = [e["event_id"] for p in (p1, p2, p3) for e in p["events"]]
+    assert ids == [f"e{i}" for i in range(5)] and len(set(ids)) == 5
+
+
+def test_get_events_pagination_with_filters(client):
+    _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z", "info")
+    _post(client, "gw-01", "e2", "2026-09-20T08:00:30Z", "error")
+    _post(client, "gw-01", "e3", "2026-09-20T08:01:00Z", "error")
+    params = [
+        ("source", "gw-01"),
+        ("severity", "error"),
+        ("start_at", "2026-09-20T08:00:00Z"),
+        ("limit", "1"),
+    ]
+    p1 = client.get("/events", params=params).json()
+    assert [e["event_id"] for e in p1["events"]] == ["e2"]
+    p2 = client.get("/events", params=[*params, ("after", p1["next_after"])]).json()
+    assert [e["event_id"] for e in p2["events"]] == ["e3"]
+
+
+def test_get_events_limit_validation(client):
+    assert client.get("/events", params={"source": "gw-01", "limit": 0}).status_code == 422
+    assert client.get("/events", params={"source": "gw-01", "limit": 1001}).status_code == 422
+
+
+def test_get_events_invalid_cursor_rejected(client):
+    resp = client.get("/events", params={"source": "gw-01", "after": "%%%not-base64"})
+    assert resp.status_code == 422
+
+
+def test_get_events_segment_id_reflects_current_segment(client):
+    # 查询返回的是当前 segment_id：桥接合并且撤回拆段后随之变化
+    a = _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z", "error")["segment"]
+    _post(client, "gw-01", "e2", "2026-09-20T08:02:00Z", "warning")
+    _post(client, "gw-01", "e3", "2026-09-20T08:01:00Z", "critical")  # 桥接
+    merged = client.get("/events", params={"source": "gw-01"}).json()
+    assert all(e["segment_id"] == a["id"] for e in merged["events"])
+
+    client.delete("/events/gw-01/e3")  # 拆回两段
+    split = client.get("/events", params={"source": "gw-01"}).json()
+    owners = {e["event_id"]: e["segment_id"] for e in split["events"]}
+    assert owners["e1"] == a["id"]
+    assert owners["e2"] != a["id"]
+
+
+def test_get_events_is_read_only(client):
+    _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z", "warning")
+    segs_before = client.get("/segments").json()
+    changes_before = client.get("/segment-changes").json()
+    for params in (
+        {"source": "gw-01"},
+        {"source": "gw-01", "severity": "warning", "limit": 1},
+        {"source": "gw-01", "start_at": "2026-09-20T08:00:00Z"},
+    ):
+        client.get("/events", params=params)
+    assert client.get("/segments").json() == segs_before
+    assert client.get("/segment-changes").json() == changes_before
+
